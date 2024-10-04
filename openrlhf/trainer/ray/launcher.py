@@ -314,3 +314,7 @@ class PPORayActorGroup:
             method = getattr(actor, method_name)
             refs.append(method.remote(*args, **kwargs))
         return refs
+
+
+class DynamicPPORayActorGroup:
+    pass

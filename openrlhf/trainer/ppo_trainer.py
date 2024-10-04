@@ -496,3 +496,74 @@ class PPOTrainer(ABC):
         self.strategy.save_ckpt(
             self.critic, os.path.join(args.ckpt_path, "_critic"), tag, args.max_ckpt_num, args.max_ckpt_mem
         )
+
+class DynamicPPOTrainer(PPOTrainer):
+
+    def run_episode(self, episode, start_episode, consumed_samples, update_timesteps):
+        if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
+                self.prompts_dataloader.sampler.set_epoch(
+                    episode, consumed_samples=0 if episode > start_episode else consumed_samples
+                )
+        pbar = tqdm(
+                range(self.prompts_dataloader.__len__()),
+                desc=f"Episode [{episode + 1}/{args.num_episodes}]",
+                disable=not self.strategy.is_rank_0(),
+            )
+
+        for rand_prompts in self.prompts_dataloader:
+            experience = self.experience_maker.make_experience(rand_prompts, **self.generate_kwargs)
+                # print prompt/answer in each update step
+            if steps % update_timesteps == 0:
+                output = self.tokenizer.batch_decode(
+                    experience.sequences[0].unsqueeze(0), skip_special_tokens=True
+                )
+                self.strategy.print(output)
+            self.replay_buffer.append(experience)
+
+            if steps % update_timesteps == 0:
+                global_steps = steps // update_timesteps
+
+                torch.cuda.empty_cache()
+                self.replay_buffer.normalize("advantages", self.strategy)
+                status = self.ppo_train(global_steps)
+                self.replay_buffer.clear()
+                torch.cuda.empty_cache()
+
+                if "kl" in status:
+                    self.kl_ctl.update(status["kl"], args.rollout_batch_size)
+                pbar.set_postfix(status)
+
+                    # logs/checkpoints
+                client_states = {"consumed_samples": global_steps * args.rollout_batch_size}
+                self.save_logs_and_checkpoints(args, global_steps, pbar, status, client_states)
+
+            pbar.update()
+            steps = steps + 1    
+
+        if self._wandb is not None and self.strategy.is_rank_0():
+            self._wandb.finish()
+        if self._tensorboard is not None and self.strategy.is_rank_0():
+            self._tensorboard.close()
+
+    def fit(self, args, prompts_dataloader, pretrain_dataloader, consumed_samples=0, num_update_steps_per_episodes=1):
+        num_rollouts_per_episodes = (
+            num_update_steps_per_episodes * args.train_batch_size // args.max_epochs // args.rollout_batch_size
+        )
+        update_timesteps = args.rollout_batch_size // (self.strategy.world_size * self.micro_rollout_batch_size)
+
+        # get eval and save steps
+        if args.eval_steps == -1:
+            args.eval_steps = num_rollouts_per_episodes  # Evaluate once per epoch
+        if args.save_steps == -1:
+            args.save_steps = float("inf")  # do not save ckpt
+
+        self.prompts_dataloader = prompts_dataloader
+        self.pretrain_dataloader = pretrain_dataloader
+
+        # Restore step and start_epoch
+        steps = consumed_samples // args.rollout_batch_size * update_timesteps + 1
+        start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
+        consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
+
+        for episode in range(start_episode, args.num_episodes):
+            self.run_episode(episode, start_episode, consumed_samples, update_timesteps)
