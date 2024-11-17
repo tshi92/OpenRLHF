@@ -1,3 +1,5 @@
+torch
+torchmetrics
 accelerate
 bitsandbytes
 datasets
@@ -11,8 +13,6 @@ optimum
 packaging
 peft
 ray[default]==2.12.0
-torch
-torchmetrics
 tqdm
 transformers==4.44.2
 transformers_stream_generator

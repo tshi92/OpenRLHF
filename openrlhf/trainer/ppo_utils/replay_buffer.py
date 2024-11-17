@@ -203,6 +203,8 @@ class NaiveReplayBuffer(ABC):
         # for DP
         # mean
         sum_and_count = torch.tensor([items_vector.sum(), action_masks_vector.sum()], device=items_vector.device)
+        #print the device that contain the vector.
+        print("Items_vector_device", items_vector.device)
         all_sum, all_count = strategy.all_reduce(sum_and_count, "sum")
         mean = all_sum / all_count
         # std

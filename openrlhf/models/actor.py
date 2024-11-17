@@ -140,6 +140,8 @@ class Actor(nn.Module):
         if kwargs.get("max_length", None):
             generate_args["max_length"] = kwargs.get("max_length")
 
+       # print("In generation phase, Actor model is in :", self.get_device())
+
         # Call generate
         sequences = self.model.generate(**generate_args)
 
@@ -220,3 +222,8 @@ class Actor(nn.Module):
 
     def print_trainable_parameters(self):
         self.model.print_trainable_parameters()
+
+    # to get the device of the actor model
+    def get_device(self):
+        device = next(self.parameters()).device
+        return device

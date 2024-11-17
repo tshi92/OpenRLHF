@@ -121,9 +121,14 @@ class NaiveExperienceMaker(ABC):
             self.reward_model.eval()
 
         # generate seq
+        start = time.time()
+
         inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
         sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
         num_actions = action_mask.size(1)
+
+        generate_time = time.time() - start
+        print("Generation Time: ", generate_time)
 
         # log probs
         action_log_probs = self.actor(sequences, num_actions, attention_mask)
@@ -245,6 +250,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             else self._generate_vllm(prompts, **generate_kwargs)
         )
         generate_time = time.time() - start
+    
 
         num_actions = action_mask.size(1)
         sequences_cpu, attention_mask_cpu, action_mask_cpu = (

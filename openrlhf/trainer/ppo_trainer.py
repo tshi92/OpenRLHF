@@ -17,6 +17,7 @@ from openrlhf.utils.distributed_sampler import DistributedSampler
 
 from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveExperienceMaker, NaiveReplayBuffer
 
+#import sys
 
 class PPOTrainer(ABC):
     """
@@ -211,6 +212,9 @@ class PPOTrainer(ABC):
 
                     torch.cuda.empty_cache()
                     self.replay_buffer.normalize("advantages", self.strategy)
+ #                   print("Replay_buffer_size: ", sys.getsizeof(self.replay_buffer.items))
+
+
                     status = self.ppo_train(global_steps)
                     self.replay_buffer.clear()
                     torch.cuda.empty_cache()
