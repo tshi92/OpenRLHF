@@ -316,5 +316,172 @@ class PPORayActorGroup:
         return refs
 
 
-class DynamicPPORayActorGroup:
-    pass
+class DynamicPPORayActorGroup(PPORayActorGroup):
+    def __init__(
+        self,
+        num_nodes,
+        num_gpus_per_node,
+        ray_actor_type: Type,
+        pg: PlacementGroup = None,
+        num_gpus_per_actor=1,
+        resources: Dict[str, float] = None,
+        num_resources_per_node: int = None,
+    ) -> None:
+        self._num_nodes = num_nodes
+        self._num_gpus_per_node = num_gpus_per_node
+        self.ray_actor_type = ray_actor_type
+
+        # Custom resources
+        self._resources = resources
+        self._num_resources_per_node = num_resources_per_node
+
+        # Initialize actors and placement group
+        self._initiate_actors(pg, num_gpus_per_actor)
+
+    def _initiate_actors(self, pg, num_gpus_per_actor):
+        self.world_size = self._num_nodes * self._num_gpus_per_node
+
+        # Create placement group if not provided
+        if self._num_gpus_per_node > 1 and pg is None:
+            bundles = [
+                {"GPU": self._num_gpus_per_node, "CPU": self._num_gpus_per_node} for _ in range(self._num_nodes)
+            ]
+            if self._resources:
+                resources_name = list(self._resources.keys())[0]
+                for i in range(len(bundles)):
+                    bundles[i][resources_name] = self._num_resources_per_node
+
+            pg = placement_group(bundles, strategy="STRICT_SPREAD")
+            ray.get(pg.ready())
+        self.pg = pg
+
+        # Create master actor
+        master_actor = self._create_actor(0, num_gpus_per_actor, pg_bundle_index=0)
+        self._actor_handlers = [master_actor]
+
+        # Create worker actors
+        if self.world_size > 1:
+            master_addr, master_port = ray.get(master_actor.get_master_addr_port.remote())
+            for rank in range(1, self.world_size):
+                local_rank = rank % self._num_gpus_per_node
+                worker_actor = self._create_actor(
+                    rank,
+                    num_gpus_per_actor,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    pg_bundle_index=rank // self._num_gpus_per_node,
+                )
+                self._actor_handlers.append(worker_actor)
+
+    def _create_actor(self, rank, num_gpus_per_actor, master_addr=None, master_port=None, pg_bundle_index=None):
+        if self.pg:
+            return self.ray_actor_type.options(
+                num_cpus=num_gpus_per_actor,
+                num_gpus=num_gpus_per_actor,
+                resources=self._resources,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=self.pg, placement_group_bundle_index=pg_bundle_index
+                ),
+            ).remote(self.world_size, rank, rank % self._num_gpus_per_node, master_addr, master_port)
+        else:
+            return self.ray_actor_type.options(
+                num_cpus=num_gpus_per_actor,
+                num_gpus=num_gpus_per_actor,
+                resources=self._resources,
+            ).remote(self.world_size, rank, rank % self._num_gpus_per_node, master_addr, master_port)
+
+    def add_actor(self, num_gpus_per_actor=1):
+        """
+        Dynamically add an actor to the group and update the placement group.
+        """
+        # Add a new bundle to the placement group
+        new_bundle = {"GPU": num_gpus_per_actor, "CPU": num_gpus_per_actor}
+        self.pg.bundles.append(new_bundle)
+        new_pg = placement_group(self.pg.bundles, strategy="STRICT_SPREAD")
+        ray.get(new_pg.ready())
+
+        # Update placement group and add a new actor
+        self.pg = new_pg
+        new_rank = len(self._actor_handlers)
+        new_actor = self._create_actor(rank=new_rank, num_gpus_per_actor=num_gpus_per_actor, pg_bundle_index=new_rank)
+        self._actor_handlers.append(new_actor)
+        print(f"Added new actor with rank {new_rank}.")
+
+    def remove_actor(self):
+        """
+        Dynamically remove an actor from the group and update the placement group.
+        """
+        if len(self._actor_handlers) <= 1:
+            print("Cannot remove the last actor.")
+            return
+
+        # Remove the last actor
+        removed_actor = self._actor_handlers.pop()
+        ray.kill(removed_actor)
+
+        # Remove the last bundle from the placement group
+        self.pg.bundles.pop()
+        new_pg = placement_group(self.pg.bundles, strategy="STRICT_SPREAD")
+        ray.get(new_pg.ready())
+        self.pg = new_pg
+        print(f"Removed an actor. Remaining actors: {len(self._actor_handlers)}.")
+
+
+    def async_fit_actor_model(
+        self,
+        critic_model_group: "PPORayActorGroup",
+        initial_model_group: "PPORayActorGroup",
+        reward_model_groups: List["PPORayActorGroup"],
+        remote_rm_urls: List[str] = None,
+        reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
+        vllm_engines: List = None,
+    ):
+        """Train actor model.
+
+        Args:
+            critic_model_group (PPORayActorGroup): critic model group.
+            initial_model_group (PPORayActorGroup): reference model group.
+            reward_model_groups (PPORayActorGroup): reward model groups.
+            remote_rm_urls: remote RM APIs.
+            reward_fn: reward calculate function, must be specified if using multiple reward models.
+            vllm_engines: vllm engines for text generation, if not specified, generate text by actor model directly.
+
+        Returns:
+            List: list of remote object refs.
+        """
+        assert (
+            (remote_rm_urls and len(remote_rm_urls) == 1)
+            or (reward_model_groups and len(reward_model_groups) == 1)
+            or reward_fn is not None
+        ), "reward_fn must be specified if using multiple reward models"
+
+        critic_actors = critic_model_group._actor_handlers
+        initial_actors = initial_model_group._actor_handlers
+
+        refs = []
+        # TODO(wuxibin): actor model choose critic/reward/initial model in a
+        # round robin fashion, implement more efficient dispatching strategy.
+        for i, actor in enumerate(self._actor_handlers):
+            critic_actor = critic_actors[i % len(critic_actors)]
+            initial_actor = initial_actors[i % len(initial_actors)]
+
+            reward_actors = []
+            if not remote_rm_urls:
+                for reward_model_group in reward_model_groups:
+                    actors = reward_model_group._actor_handlers
+                    reward_actors.append(actors[i % len(actors)])
+
+            refs.append(
+                actor.fit.remote(
+                    critic_model=critic_actor,
+                    initial_model=initial_actor,
+                    reward_model=reward_actors,
+                    remote_rm_url=remote_rm_urls,
+                    reward_fn=reward_fn,
+                    vllm_engines=vllm_engines,
+                    # whether this actor should triger corresponding critic model training
+                    critic_train_remote=(i < len(critic_actors)),
+                )
+            )
+
+        return refs
