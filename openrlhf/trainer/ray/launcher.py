@@ -390,7 +390,7 @@ class DynamicPPORayActorGroup(PPORayActorGroup):
                 resources=self._resources,
             ).remote(self.world_size, rank, rank % self._num_gpus_per_node, master_addr, master_port)
 
-    def add_actor(self, num_gpus_per_actor=1):
+    def add_actor(self, num_gpus_per_actor=1, *args, **kwargs):
         """
         Dynamically add an actor to the group and update the placement group.
         """
@@ -404,6 +404,7 @@ class DynamicPPORayActorGroup(PPORayActorGroup):
         self.pg = new_pg
         new_rank = len(self._actor_handlers)
         new_actor = self._create_actor(rank=new_rank, num_gpus_per_actor=num_gpus_per_actor, pg_bundle_index=new_rank)
+        new_actor.init_model_from_pretrained.remote(*args, **kwargs)
         self._actor_handlers.append(new_actor)
         print(f"Added new actor with rank {new_rank}.")
 
