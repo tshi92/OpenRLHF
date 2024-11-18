@@ -9,6 +9,7 @@ import deepspeed
 import ray
 import torch
 from transformers.trainer import get_scheduler
+from tqdm import tqdm
 
 from openrlhf.datasets import PromptDataset, SFTDataset
 from openrlhf.models import Actor
@@ -338,8 +339,8 @@ class ActorModelRayActor(BasePPORole):
         args = self.strategy.args
 
         # configure Trainer
-        # trainer = ActorPPOTrainer(
-        trainer = DynamicPPOTrainer(
+        trainer = ActorPPOTrainer(
+        #trainer = DynamicPPOTrainer(
             strategy,
             self.actor,
             critic_model,
@@ -406,72 +407,103 @@ class ActorModelRayActor(BasePPORole):
 
 class DynamicPPOTrainer(ActorPPOTrainer):
 
+    def initialize_fit(
+        self,
+        args,
+        prompts_dataloader,
+        pretrain_dataloader,
+        consumed_samples=0,
+        num_update_steps_per_episodes=1,
+    ):
+        """
+        Initialize the parameters and settings for the fit process.
+        """
+        self.prompts_dataloader = prompts_dataloader
+        self.pretrain_dataloader = pretrain_dataloader
 
-    def run_episode(self, episode, start_episode, consumed_samples, update_timesteps):
+        self.num_rollouts_per_episodes = (
+            num_update_steps_per_episodes * args.train_batch_size // args.max_epochs // args.rollout_batch_size
+        )
+        self.update_timesteps = args.rollout_batch_size // (self.strategy.world_size * self.micro_rollout_batch_size)
+
+        # Get eval and save steps
+        if args.eval_steps == -1:
+            args.eval_steps = self.num_rollouts_per_episodes  # Evaluate once per epoch
+        if args.save_steps == -1:
+            args.save_steps = float("inf")  # Do not save ckpt
+
+        # Restore step and start_epoch
+        self.steps = consumed_samples // args.rollout_batch_size * self.update_timesteps + 1
+        self.start_episode = consumed_samples // args.rollout_batch_size // self.num_rollouts_per_episodes
+        self.consumed_samples = consumed_samples % (self.num_rollouts_per_episodes * args.rollout_batch_size)
+
+        # Initialize dataloader sampler
         if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
-                self.prompts_dataloader.sampler.set_epoch(
-                    episode, consumed_samples=0 if episode > start_episode else consumed_samples
-                )
-        pbar = tqdm(
-                range(self.prompts_dataloader.__len__()),
+            self.prompts_dataloader.sampler.set_epoch(
+                self.start_episode, consumed_samples=self.consumed_samples
+            )
+
+    def process_single_prompt(self, args, pbar):
+        """
+        Process a single data sample from the dataloader.
+        """
+        # Sample a single prompt from the dataloader
+        rand_prompt = next(iter(self.prompts_dataloader))
+
+        # Generate experience from the current prompt
+        experience = self.experience_maker.make_experience(rand_prompt, **self.generate_kwargs)
+
+        # Print prompt/answer in each update step
+        if self.steps % self.update_timesteps == 0:
+            output = self.tokenizer.batch_decode(
+                experience.sequences[0].unsqueeze(0), skip_special_tokens=True
+            )
+            self.strategy.print(output)
+
+        self.replay_buffer.append(experience)
+
+        # Perform PPO training and log results
+        if self.steps % self.update_timesteps == 0:
+            global_steps = self.steps // self.update_timesteps
+
+            torch.cuda.empty_cache()
+            self.replay_buffer.normalize("advantages", self.strategy)
+            status = self.ppo_train(global_steps)
+            self.replay_buffer.clear()
+            torch.cuda.empty_cache()
+
+            if "kl" in status:
+                self.kl_ctl.update(status["kl"], args.rollout_batch_size)
+
+            pbar.set_postfix(status)
+
+            # Logs/checkpoints
+            client_states = {"consumed_samples": global_steps * args.rollout_batch_size}
+            self.save_logs_and_checkpoints(args, global_steps, pbar, status, client_states)
+
+        pbar.update()
+        self.steps += 1
+    
+    def fit(self, args):
+        """
+        Overall fit process, iterates over episodes and processes prompts.
+        """
+        # Initialize parameters
+        self.initialize_fit(args, self.prompts_dataloader, self.pretrain_dataloader)
+
+        for episode in range(self.start_episode, args.num_episodes):
+            pbar = tqdm(
+                range(len(self.prompts_dataloader)),
                 desc=f"Episode [{episode + 1}/{args.num_episodes}]",
                 disable=not self.strategy.is_rank_0(),
             )
 
-        for rand_prompts in self.prompts_dataloader:
-            experience = self.experience_maker.make_experience(rand_prompts, **self.generate_kwargs)
-                # print prompt/answer in each update step
-            if steps % update_timesteps == 0:
-                output = self.tokenizer.batch_decode(
-                    experience.sequences[0].unsqueeze(0), skip_special_tokens=True
-                )
-                self.strategy.print(output)
-            self.replay_buffer.append(experience)
+            # Process each prompt for the current episode
+            for _ in range(len(self.prompts_dataloader)): # will be revised.
+                self.process_single_prompt(args, pbar)
 
-            if steps % update_timesteps == 0:
-                global_steps = steps // update_timesteps
-
-                torch.cuda.empty_cache()
-                self.replay_buffer.normalize("advantages", self.strategy)
-                status = self.ppo_train(global_steps)
-                self.replay_buffer.clear()
-                torch.cuda.empty_cache()
-
-                if "kl" in status:
-                    self.kl_ctl.update(status["kl"], args.rollout_batch_size)
-                pbar.set_postfix(status)
-
-                    # logs/checkpoints
-                client_states = {"consumed_samples": global_steps * args.rollout_batch_size}
-                self.save_logs_and_checkpoints(args, global_steps, pbar, status, client_states)
-
-            pbar.update()
-            steps = steps + 1    
-
+        # Finalize logging
         if self._wandb is not None and self.strategy.is_rank_0():
             self._wandb.finish()
         if self._tensorboard is not None and self.strategy.is_rank_0():
             self._tensorboard.close()
-
-    def fit(self, args, prompts_dataloader, pretrain_dataloader, consumed_samples=0, num_update_steps_per_episodes=1):
-        num_rollouts_per_episodes = (
-            num_update_steps_per_episodes * args.train_batch_size // args.max_epochs // args.rollout_batch_size
-        )
-        update_timesteps = args.rollout_batch_size // (self.strategy.world_size * self.micro_rollout_batch_size)
-
-        # get eval and save steps
-        if args.eval_steps == -1:
-            args.eval_steps = num_rollouts_per_episodes  # Evaluate once per epoch
-        if args.save_steps == -1:
-            args.save_steps = float("inf")  # do not save ckpt
-
-        self.prompts_dataloader = prompts_dataloader
-        self.pretrain_dataloader = pretrain_dataloader
-
-        # Restore step and start_epoch
-        steps = consumed_samples // args.rollout_batch_size * update_timesteps + 1
-        start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
-        consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
-
-        for episode in range(start_episode, args.num_episodes):
-            self.run_episode(episode, start_episode, consumed_samples, update_timesteps)
