@@ -92,7 +92,7 @@ class ActorPPOTrainer(PPOTrainer):
                     "Warning: using --vllm_sync_backend=gloo for vLLM version > 0.4.2 (or export NCCL_P2P_DISABLE=1)"
                 )
 
-            refs = [
+            refs = [ 
                 engine.init_process_group.remote(
                     master_address,
                     master_port,
@@ -403,6 +403,8 @@ class ActorModelRayActor(BasePPORole):
             self.tokenizer,
             args.save_path,
         )
+
+# TODO: 1. Rewrite Dataloader; 2. Update RayActorGroup means need to reprepare Deepspeed of all actor/critic models; 3. Revise the fit function in DynamicPPOTrainer.  
 
 
 class DynamicPPOTrainer(ActorPPOTrainer):

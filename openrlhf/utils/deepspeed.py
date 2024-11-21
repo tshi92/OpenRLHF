@@ -182,7 +182,7 @@ class DeepspeedStrategy(ABC):
         else:
             return model
 
-    def prepare(
+    def prepare( # prepare deepspeed. It is extremly important! ###
         self, *models_or_model_optim_pairs: ModelOrModelOptimPair, is_rlhf=False
     ) -> Union[List[ModelOrModelOptimPair], ModelOrModelOptimPair]:
         ret = []

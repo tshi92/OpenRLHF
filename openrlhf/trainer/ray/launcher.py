@@ -7,10 +7,10 @@ import ray
 import torch
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-
+from openrlhf.utils import DeepspeedStrategy, blending_datasets, get_tokenizer
+from openrlhf.datasets import PromptDataset, SFTDataset
+from torch.utils.data.sampler import RandomSampler
 from openrlhf.models import Actor, get_llm_for_sequence_regression
-from openrlhf.utils import DeepspeedStrategy, get_tokenizer
-
 
 class DistributedTorchRayActor:
     def __init__(self, world_size, rank, local_rank, master_addr, master_port):
@@ -317,27 +317,6 @@ class PPORayActorGroup:
 
 
 class DynamicPPORayActorGroup(PPORayActorGroup):
-    def __init__(
-        self,
-        num_nodes,
-        num_gpus_per_node,
-        ray_actor_type: Type,
-        pg: PlacementGroup = None,
-        num_gpus_per_actor=1,
-        resources: Dict[str, float] = None,
-        num_resources_per_node: int = None,
-    ) -> None:
-        self._num_nodes = num_nodes
-        self._num_gpus_per_node = num_gpus_per_node
-        self.ray_actor_type = ray_actor_type
-
-        # Custom resources
-        self._resources = resources
-        self._num_resources_per_node = num_resources_per_node
-
-        # Initialize actors and placement group
-        self._initiate_actors(pg, num_gpus_per_actor)
-
     def _initiate_actors(self, pg, num_gpus_per_actor):
         self.world_size = self._num_nodes * self._num_gpus_per_node
 
@@ -428,16 +407,76 @@ class DynamicPPORayActorGroup(PPORayActorGroup):
         print(f"Removed an actor. Remaining actors: {len(self._actor_handlers)}.")
 
 
-    def async_fit_actor_model(
-        self,
-        critic_model_group: "PPORayActorGroup",
-        initial_model_group: "PPORayActorGroup",
-        reward_model_groups: List["PPORayActorGroup"],
-        remote_rm_urls: List[str] = None,
-        reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
-        vllm_engines: List = None,
+    def adjust_actor_group_resources(self):
+        pass
+    
+    
+    def prepare_datasets(self, strategy: DeepspeedStrategy): # needs further revision
+        strategy = self.strategy
+        args = self.strategy.args
+
+        # prepare datasets
+        prompts_data = blending_datasets(
+            args.prompt_data,
+            args.prompt_data_probs,
+            strategy,
+            args.seed,
+            max_count=args.max_samples,
+            return_eval=False,
+            train_split=args.prompt_split,
+        )
+        prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
+        self.prompts_dataset = PromptDataset(
+            prompts_data, self.tokenizer, strategy, input_template=args.input_template
+        )
+        self.prompts_dataloader = strategy.setup_dataloader(
+            self.prompts_dataset, args.micro_rollout_batch_size, True, True, sampler= RandomSampler
+        )
+
+        if args.pretrain_data:
+            pretrain_data = blending_datasets(
+                args.pretrain_data,
+                args.pretrain_data_probs,
+                strategy,
+                args.seed,
+                return_eval=False,
+                train_split=args.pretrain_split,
+            )
+            pretrain_max_len = args.max_len if args.max_len else args.prompt_max_len + args.generate_max_len
+            pretrain_dataset = SFTDataset(
+                pretrain_data.select(range(min(len(pretrain_data), args.max_epochs * len(self.prompts_dataset)))),
+                self.tokenizer,
+                pretrain_max_len,
+                strategy,
+                pretrain_mode=True,
+            )
+            self.pretrain_dataloader = itertools.cycle(
+                iter(
+                    strategy.setup_dataloader(
+                        pretrain_dataset,
+                        args.micro_train_batch_size,
+                        True,
+                        True,
+                        pretrain_dataset.collate_fn,
+                    )
+                )
+            )
+        else:
+            self.pretrain_dataloader = None
+    
+    
+    
+    def async_fit_actor_model(self,
+    critic_model_group: "PPORayActorGroup",
+    initial_model_group: "PPORayActorGroup",
+    reward_model_groups: List["PPORayActorGroup"],
+    strategy: DeepspeedStrategy,
+    remote_rm_urls: List[str] = None,
+    reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
+    vllm_engines: List = None,
     ):
-        """Train actor model.
+        """
+        Train actor model with dynamic resource adjustment.
 
         Args:
             critic_model_group (PPORayActorGroup): critic model group.
@@ -459,30 +498,41 @@ class DynamicPPORayActorGroup(PPORayActorGroup):
         critic_actors = critic_model_group._actor_handlers
         initial_actors = initial_model_group._actor_handlers
 
-        refs = []
-        # TODO(wuxibin): actor model choose critic/reward/initial model in a
-        # round robin fashion, implement more efficient dispatching strategy.
-        for i, actor in enumerate(self._actor_handlers):
-            critic_actor = critic_actors[i % len(critic_actors)]
-            initial_actor = initial_actors[i % len(initial_actors)]
+        # Flatten reward actors for easier indexing
+        reward_actors = []
+        if not remote_rm_urls:
+            for reward_model_group in reward_model_groups:
+                reward_actors.extend(reward_model_group._actor_handlers)
 
-            reward_actors = []
-            if not remote_rm_urls:
-                for reward_model_group in reward_model_groups:
-                    actors = reward_model_group._actor_handlers
-                    reward_actors.append(actors[i % len(actors)])
+        # Maximum number of prompts to process
+        #### The following code needs further revision
+        max_prompts = len(self.prompts_dataloader)
 
-            refs.append(
-                actor.fit.remote(
-                    critic_model=critic_actor,
-                    initial_model=initial_actor,
-                    reward_model=reward_actors,
-                    remote_rm_url=remote_rm_urls,
-                    reward_fn=reward_fn,
-                    vllm_engines=vllm_engines,
-                    # whether this actor should triger corresponding critic model training
-                    critic_train_remote=(i < len(critic_actors)),
+        for prompt_idx in range(max_prompts):
+            refs = []
+            for i, actor in enumerate(self._actor_handlers):
+                critic_actor = critic_actors[i % len(critic_actors)]
+                initial_actor = initial_actors[i % len(initial_actors)]
+
+                # Select reward actors based on round-robin
+                reward_actor_subset = (
+                    [reward_actors[i % len(reward_actors)]] if reward_actors else []
                 )
-            )
 
-        return refs
+                # Dispatch task to actor
+                refs.append(
+                    actor.process_single_prompt.remote(
+                        critic_model=critic_actor,
+                        initial_model=initial_actor,
+                        reward_model=reward_actor_subset,
+                        remote_rm_url=remote_rm_urls,
+                        reward_fn=reward_fn,
+                        vllm_engines=vllm_engines,
+                    )
+                )
+
+            # Wait for current batch to finish processing
+            ray.get(refs)
+
+            # Adjust resources dynamically
+            self.adjust_actor_group_resources()
